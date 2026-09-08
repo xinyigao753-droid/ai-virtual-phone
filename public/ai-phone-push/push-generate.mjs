@@ -264,6 +264,25 @@ async function decryptPayload(payload: EncryptedPayload, serviceKey: string): Pr
 // ── 主流程 ──
 type JobRow = { id: string; user_id: string; trigger_key: string; kind: string; payload: EncryptedPayload };
 type SubscriptionRow = { endpoint: string; p256dh: string; auth: string };
+
+async function deliverTencentRelay(
+  origin: string,
+  token: string,
+  message: Record<string, unknown>,
+): Promise<boolean> {
+  if (!origin.startsWith("https://")) return false;
+  try {
+    const response = await fetch(`${origin}/api/push/tencent/deliver`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: token.slice("tencent:".length), payload: message }),
+    });
+    await response.text().catch(() => "");
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
 type JobPayload = {
   request: { url: string; headers: Record<string, string>; body: Record<string, unknown>; providerKind: ProviderKind };
   shortcut?: {
@@ -1078,8 +1097,9 @@ Deno.serve(async (req: Request) => {
     const pushErrors: string[] = [];
     // 安卓壳（FloatShell App）的合成订阅（endpoint 以 shell: 开头）不走 Web Push，
     // 改由 Supabase Realtime 广播送达壳内长连接。
-    const webSubs = subs.filter(sub => !sub.endpoint.startsWith("shell:"));
-    const hasShellSub = webSubs.length < subs.length;
+    const relaySubs = subs.filter(sub => sub.endpoint.startsWith("tencent:"));
+    const webSubs = subs.filter(sub => !sub.endpoint.startsWith("shell:") && !sub.endpoint.startsWith("tencent:"));
+    const hasShellSub = webSubs.length + relaySubs.length < subs.length;
     const vapid = vapidRow
       ? { publicKey: vapidRow.vapid_public_key, privateKey: vapidRow.vapid_private_key, subject: siteOrigin || "mailto:push@ai-phone.local" }
       : null;
@@ -1147,6 +1167,17 @@ Deno.serve(async (req: Request) => {
         } catch (err) {
           pushErrors.push(`shell ${(err instanceof Error ? err.message : String(err)).slice(0, 60)}`);
         }
+      }
+      for (const sub of relaySubs) {
+        const ok = await deliverTencentRelay(siteOrigin, sub.endpoint, {
+          type: deliverAsCall ? "incoming_call" : "chat_outbox",
+          title: deliverAsCall ? `📞 ${title}` : title,
+          body: partBody,
+          url: targetUrl,
+          ...(deliverAsCall ? { sessionId: callSessionId, callTs: Date.now() } : {}),
+        });
+        if (ok) pushed += 1;
+        else pushErrors.push("tencent relay failed");
       }
       await progress(`pushed ${index + 1}/${parts.length}${pushErrors.length ? `, errors: ${pushErrors[0]}` : ""}`);
     }

@@ -286,6 +286,21 @@ async function decryptPayload(payload: EncryptedPayload, serviceKey: string): Pr
 
 type JobRow = { id: string; user_id: string; trigger_key: string; kind: string };
 type SubscriptionRow = { endpoint: string; p256dh: string; auth: string };
+
+async function deliverTencentRelay(origin: string, token: string, message: Record<string, unknown>): Promise<boolean> {
+  if (!origin.startsWith("https://")) return false;
+  try {
+    const response = await fetch(`${origin}/api/push/tencent/deliver`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: token.slice("tencent:".length), payload: message }),
+    });
+    await response.text().catch(() => "");
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
 type BridgeItem = { id: string; type: string; payload: string; createdAt: string };
 
 type ServerBridgeRule = {
@@ -488,25 +503,33 @@ Deno.serve(async (req: Request) => {
     const vapidResponse = await rest("push_server_config?id=eq.main&select=vapid_public_key,vapid_private_key&limit=1");
     const vapidRows = vapidResponse.ok ? await vapidResponse.json() as { vapid_public_key: string; vapid_private_key: string }[] : [];
     const vapidRow = vapidRows[0];
+    const relaySubs = subs.filter(sub => sub.endpoint.startsWith("tencent:"));
+    const webSubs = subs.filter(sub => !sub.endpoint.startsWith("tencent:"));
     const vapid = vapidRow
       ? { publicKey: vapidRow.vapid_public_key, privateKey: vapidRow.vapid_private_key, subject: siteOrigin || "mailto:push@ai-phone.local" }
       : null;
     const pushErrors: string[] = [];
 
     const sendPush = async (title: string, bodyText: string, tag: string) => {
-      if (!vapid || subs.length === 0) return;
+      if ((!vapid && relaySubs.length === 0) || subs.length === 0) return;
       const message = JSON.stringify({ title, body: bodyText.slice(0, 80), tag, url: "/" });
-      for (const sub of subs) {
-        try {
-          const status = await sendWebPushRaw(sub, message, vapid, 3600);
-          if (status === 404 || status === 410) {
-            await rest(`push_subscriptions?endpoint=eq.${encodeURIComponent(sub.endpoint)}`, { method: "DELETE" }).catch(() => undefined);
-          } else if (status >= 400) {
-            pushErrors.push(`http ${status}`);
+      if (vapid) {
+        for (const sub of webSubs) {
+          try {
+            const status = await sendWebPushRaw(sub, message, vapid, 3600);
+            if (status === 404 || status === 410) {
+              await rest(`push_subscriptions?endpoint=eq.${encodeURIComponent(sub.endpoint)}`, { method: "DELETE" }).catch(() => undefined);
+            } else if (status >= 400) {
+              pushErrors.push(`http ${status}`);
+            }
+          } catch (err) {
+            pushErrors.push((err instanceof Error ? err.message : String(err)).slice(0, 80));
           }
-        } catch (err) {
-          pushErrors.push((err instanceof Error ? err.message : String(err)).slice(0, 80));
         }
+      }
+      for (const sub of relaySubs) {
+        const ok = await deliverTencentRelay(siteOrigin, sub.endpoint, { title, body: bodyText.slice(0, 80), tag, url: "/", type: "bridge" });
+        if (!ok) pushErrors.push("tencent relay failed");
       }
     };
 

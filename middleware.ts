@@ -18,6 +18,8 @@ const PUBLIC_ROUTE_PREFIXES = [
   // 个人云的离线生成把「代发触发邮件」外包给站点，同样没有登录 cookie，
   // 凭 bridge_token 认账号（见该路由内的说明）。
   "/api/push/shortcut-commands/deliver-email/",
+  // 安卓壳的腾讯云中转通道不携带网页登录 Cookie，令牌本身是 256 位随机值。
+  "/api/push/tencent/",
 ];
 
 const STATIC_ROUTE_PREFIXES = [

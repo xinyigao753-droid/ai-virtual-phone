@@ -221,6 +221,10 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun getVersion(): String = VERSION
 
+        /** 个人云只保存这个随机设备令牌，不接触站点 Cookie 或用户 API 密钥。 */
+        @JavascriptInterface
+        fun getPushToken(): String = PushService.getOrCreatePushToken(applicationContext)
+
         /** 打开本应用的系统设置页（引导用户关电池限制、开自启动）。 */
         @JavascriptInterface
         fun openAppSettings() {

@@ -217,6 +217,21 @@ async function sendWebPushRaw(
   return response.status;
 }
 
+async function deliverTencentRelay(origin: string, token: string, payload: Record<string, unknown>): Promise<boolean> {
+  if (!origin.startsWith("https://")) return false;
+  try {
+    const response = await fetch(`${origin}/api/push/tencent/deliver`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: token.slice("tencent:".length), payload }),
+    });
+    await response.text().catch(() => "");
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
 async function encryptPayload(plain: string, secret: string): Promise<EncryptedPayload> {
   const keyBytes = await crypto.subtle.digest("SHA-256", utf8(`${secret}:push-job-v1`));
   const key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
@@ -523,7 +538,9 @@ Deno.serve(async (request: Request) => {
     });
     let sent = 0;
     const errors: string[] = [];
-    for (const subscription of subscriptions) {
+    const relaySubscriptions = subscriptions.filter(subscription => subscription.endpoint.startsWith("tencent:"));
+    const webSubscriptions = subscriptions.filter(subscription => !subscription.endpoint.startsWith("tencent:"));
+    for (const subscription of webSubscriptions) {
       try {
         const status = await sendWebPushRaw(subscription, payload, {
           publicKey: config.vapid_public_key,
@@ -540,6 +557,16 @@ Deno.serve(async (request: Request) => {
       } catch (error) {
         errors.push(error instanceof Error ? error.message : String(error));
       }
+    }
+    for (const subscription of relaySubscriptions) {
+      const ok = await deliverTencentRelay(siteOrigin, subscription.endpoint, {
+        type: "shortcut_command",
+        title: `运行「${command.action_name}」`,
+        body: "角色请求执行一条已授权的快捷动作，轻点开始。",
+        url: navigate,
+      });
+      if (ok) sent += 1;
+      else errors.push("tencent relay failed");
     }
     if (sent > 0) {
       const now = new Date().toISOString();
@@ -590,6 +617,8 @@ Deno.serve(async (request: Request) => {
         const p256dh = cleanText(body.keys?.p256dh, 300);
         const auth = cleanText(body.keys?.auth, 300);
         if (!endpoint || !p256dh || !auth) return json({ ok: false, error: "订阅数据不完整。" }, 400);
+        // 同时固化当前腾讯云站点地址，定时函数稍后才能把消息送回正确中转入口。
+        await loadConfig();
         await readJson(await rest("push_subscriptions?on_conflict=endpoint", {
           method: "POST",
           headers: { Prefer: "resolution=merge-duplicates,return=representation" },
@@ -1029,7 +1058,9 @@ $CRON$)`);
       });
       let sent = 0;
       const errors: string[] = [];
-      for (const subscription of subscriptions) {
+      const relaySubscriptions = subscriptions.filter(subscription => subscription.endpoint.startsWith("tencent:"));
+      const webSubscriptions = subscriptions.filter(subscription => !subscription.endpoint.startsWith("tencent:"));
+      for (const subscription of webSubscriptions) {
         try {
           const status = await sendWebPushRaw(subscription, payload, {
             publicKey: config.vapid_public_key,
@@ -1046,6 +1077,17 @@ $CRON$)`);
         } catch (error) {
           errors.push(error instanceof Error ? error.message : String(error));
         }
+      }
+      for (const subscription of relaySubscriptions) {
+        const ok = await deliverTencentRelay(subject, subscription.endpoint, {
+          type: "chat_outbox_test",
+          title: "小手机",
+          body: "个人 Supabase 离线推送已连通。",
+          tag: `personal-push-test-${Date.now()}`,
+          url: "/",
+        });
+        if (ok) sent += 1;
+        else errors.push("tencent relay failed");
       }
       if (sent === 0) return json({ ok: false, error: errors[0] || "测试推送发送失败。" }, 500);
       return json({ ok: true, sent, total: subscriptions.length });

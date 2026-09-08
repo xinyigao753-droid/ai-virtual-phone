@@ -103,6 +103,32 @@ export function isShellEnvironment(): boolean {
     return typeof navigator !== "undefined" && navigator.userAgent.includes("FloatShell/");
 }
 
+type AndroidShellBridge = { getPushToken?: () => string };
+
+/** 将安卓设备登记到个人云；通知内容随后由个人云经腾讯云中转给原生服务。 */
+export async function ensureShellPushSubscription(): Promise<{ ok: boolean; error?: string }> {
+    if (!isShellEnvironment()) return { ok: false, error: "当前不是 App 环境。" };
+    if (!isPersonalPushCloudActive()) return { ok: false, error: "个人离线推送尚未启用。" };
+    const bridge = (window as typeof window & { AndroidShell?: AndroidShellBridge }).AndroidShell;
+    const token = bridge?.getPushToken?.().trim() || "";
+    if (!/^[a-f0-9]{64}$/.test(token)) return { ok: false, error: "设备推送令牌不可用。" };
+    try {
+        const response = await personalPushFetch("subscribe", {
+            method: "POST",
+            body: JSON.stringify({
+                endpoint: `tencent:${token}`,
+                keys: { p256dh: "tencent", auth: "tencent" },
+            }),
+        });
+        const data = await response.json().catch(() => ({})) as { ok?: boolean; error?: string };
+        if (!response.ok || !data.ok) return { ok: false, error: data.error || "App 推送登记失败。" };
+        markAccountPushSubscribed(true);
+        return { ok: true };
+    } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : "App 推送登记失败。" };
+    }
+}
+
 function isPushSupported(): boolean {
     return typeof window !== "undefined"
         && "serviceWorker" in navigator

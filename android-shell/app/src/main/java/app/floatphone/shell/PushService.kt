@@ -9,27 +9,22 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
-import android.webkit.CookieManager
 import androidx.core.app.NotificationCompat
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.Response
-import okhttp3.WebSocket
-import okhttp3.WebSocketListener
 import org.json.JSONObject
+import java.security.SecureRandom
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
 /**
  * 推送前台服务：不依赖 Google 服务的自建长连接。
  *
- * 原理：用 WebView 里已登录的站点 Cookie 调用站点接口拿到
- * Supabase 地址 / anon key / 当前用户 id，然后用 OkHttp WebSocket
- * 直连 Supabase Realtime，订阅个人频道 shellpush:<userId>。
- * 服务端（push-generate / 测试按钮）发离线消息时会向该频道广播一份，
- * 本服务收到即弹系统通知——App 被杀也能收（前台服务存活期间）。
+ * 原理：用安装时生成的随机设备令牌长轮询腾讯云同源接口。
+ * 个人 Supabase 只负责生成消息并把通知 POST 给腾讯云，手机不直接访问
+ * Supabase、Google 或其他境外推送服务。
  */
 class PushService : Service() {
 
@@ -38,6 +33,8 @@ class PushService : Service() {
         private const val CH_MESSAGES = "shell_messages"
         private const val CH_CALLS = "shell_calls"
         private const val NOTIF_FG_ID = 1
+        private const val PUSH_PREFS = "shell_push"
+        private const val PUSH_TOKEN_KEY = "device_token"
         private var running = false
 
         fun start(context: Context) {
@@ -46,18 +43,27 @@ class PushService : Service() {
             if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent)
             else context.startService(intent)
         }
+
+        @Synchronized
+        fun getOrCreatePushToken(context: Context): String {
+            val prefs = context.getSharedPreferences(PUSH_PREFS, Context.MODE_PRIVATE)
+            val existing = prefs.getString(PUSH_TOKEN_KEY, null).orEmpty()
+            if (existing.matches(Regex("^[a-f0-9]{64}$"))) return existing
+            val bytes = ByteArray(32).also { SecureRandom().nextBytes(it) }
+            val created = bytes.joinToString("") { "%02x".format(it) }
+            prefs.edit().putString(PUSH_TOKEN_KEY, created).apply()
+            return created
+        }
     }
 
     private val client = OkHttpClient.Builder()
-        .pingInterval(25, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(35, TimeUnit.SECONDS)
+        .callTimeout(40, TimeUnit.SECONDS)
         .build()
 
-    private var socket: WebSocket? = null
     private var stopped = false
-    private var msgSeq = 2
     private var notifId = 100
-    private var shellSubRegistered = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -74,174 +80,59 @@ class PushService : Service() {
     override fun onDestroy() {
         stopped = true
         running = false
-        socket?.cancel()
+        client.dispatcher.cancelAll()
         super.onDestroy()
     }
 
-    // ── 连接循环：拿配置 → 连 WS → 断线退避重连 ──
+    // 腾讯云每次保持约 25 秒长轮询；断网时退避，恢复后自动续上。
     private fun connectionLoop() {
         var backoffSec = 5L
+        val token = getOrCreatePushToken(applicationContext)
         while (!stopped) {
-            val config = fetchConfig()
-            if (config == null) {
-                updateKeepAlive("未登录或站点不可达，稍后重试")
-                sleepSec(60); continue
+            try {
+                val message = pollTencent(token)
+                updateKeepAlive("已连接，等待角色消息")
+                backoffSec = 5
+                if (message != null) showRelayMessage(message)
+            } catch (_: Throwable) {
+                if (stopped) break
+                updateKeepAlive("连接断开，重连中…")
+                sleepSec(backoffSec)
+                backoffSec = (backoffSec * 2).coerceAtMost(120)
             }
-            updateKeepAlive("已连接，等待角色消息")
-            val closedNormally = runSocket(config)
-            if (stopped) break
-            updateKeepAlive("连接断开，重连中…")
-            sleepSec(if (closedNormally) 3 else backoffSec)
-            backoffSec = (backoffSec * 2).coerceAtMost(120)
-            if (closedNormally) backoffSec = 5
         }
     }
 
-    private data class PushConfig(val supabaseUrl: String, val anonKey: String, val userId: String)
-
-    /** 借 WebView 的登录 Cookie 调站点接口获取连接参数。 */
-    private fun fetchConfig(): PushConfig? = runCatching {
-        val cookie = CookieManager.getInstance().getCookie(MainActivity.SITE_URL) ?: return null
-
-        fun getJson(path: String): JSONObject? {
-            val request = Request.Builder()
-                .url("${MainActivity.SITE_URL}$path")
-                .header("Cookie", cookie)
-                .header("Accept", "application/json")
-                .build()
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) return null
-                return JSONObject(response.body?.string() ?: return null)
-            }
+    private fun pollTencent(token: String): JSONObject? {
+        val body = JSONObject().put("token", token).toString()
+            .toRequestBody("application/json; charset=utf-8".toMediaType())
+        val request = Request.Builder()
+            .url("${MainActivity.SITE_URL}/api/push/tencent/poll")
+            .header("Accept", "application/json")
+            .post(body)
+            .build()
+        client.newCall(request).execute().use { response ->
+            if (response.code == 204) return null
+            if (!response.isSuccessful) error("push relay HTTP ${response.code}")
+            val root = JSONObject(response.body?.string().orEmpty())
+            return root.optJSONObject("message")
         }
+    }
 
-        val me = getJson("/api/auth/me") ?: return null
-        val userId = me.optJSONObject("account")?.optString("id").orEmpty()
-        if (userId.isEmpty()) return null
-        val online = getJson("/api/online/config") ?: return null
-        if (!online.optBoolean("configured")) return null
-        val url = online.optString("supabaseUrl")
-        val key = online.optString("anonKey")
-        if (url.isEmpty() || key.isEmpty()) return null
-        registerShellSubscription(cookie, userId)
-        PushConfig(url.trimEnd('/'), key, userId)
-    }.getOrNull()
-
-    /**
-     * 在站点注册一条合成推送订阅（endpoint = shell:<userId>）。
-     * 作用是让离线消息排期的"账号已订阅"门控放行，并让服务端知道
-     * 要往 shellpush 频道广播；服务端不会对它做 Web Push 投递。
-     */
-    private fun registerShellSubscription(cookie: String, userId: String) {
-        if (shellSubRegistered) return
-        runCatching {
-            val body = JSONObject()
-                .put("endpoint", "shell:$userId")
-                .put(
-                    "keys",
-                    JSONObject().put("p256dh", "shell").put("auth", "shell"),
+    private fun showRelayMessage(message: JSONObject) {
+        val title = message.optString("title").ifEmpty { "小手机" }
+        val body = message.optString("body").ifEmpty { "有新消息" }
+        if (message.optString("type") == "incoming_call") {
+            val shown = runCatching {
+                showIncomingCallNotification(
+                    title.removePrefix("📞 "),
+                    message.optString("sessionId"),
+                    message.optLong("callTs", System.currentTimeMillis()),
                 )
-                .toString()
-                .toRequestBody("application/json".toMediaType())
-            val request = Request.Builder()
-                .url("${MainActivity.SITE_URL}/api/push/subscribe")
-                .header("Cookie", cookie)
-                .post(body)
-                .build()
-            client.newCall(request).execute().use { response ->
-                if (response.isSuccessful) shellSubRegistered = true
-            }
+            }.isSuccess
+            if (shown) return
         }
-    }
-
-    /** 跑一条 WebSocket 直到断开；返回是否属于正常关闭。 */
-    private fun runSocket(config: PushConfig): Boolean {
-        val wsUrl = config.supabaseUrl.replaceFirst("http", "ws") +
-            "/realtime/v1/websocket?apikey=${config.anonKey}&vsn=1.0.0"
-        val topic = "realtime:shellpush:${config.userId}"
-        val lock = Object()
-        var normal = false
-        var done = false
-
-        val listener = object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                val join = JSONObject()
-                    .put("topic", topic)
-                    .put("event", "phx_join")
-                    .put("ref", "1")
-                    .put(
-                        "payload",
-                        JSONObject().put(
-                            "config",
-                            JSONObject()
-                                .put("broadcast", JSONObject().put("self", false))
-                                .put("presence", JSONObject().put("key", "")),
-                        ),
-                    )
-                webSocket.send(join.toString())
-                // Phoenix 心跳（OkHttp pingInterval 是 TCP 层，这里是协议层）
-                thread(name = "shell-push-heartbeat") {
-                    while (!done && !stopped) {
-                        sleepSec(25)
-                        if (done || stopped) break
-                        runCatching {
-                            webSocket.send(
-                                JSONObject()
-                                    .put("topic", "phoenix")
-                                    .put("event", "heartbeat")
-                                    .put("payload", JSONObject())
-                                    .put("ref", (msgSeq++).toString())
-                                    .toString(),
-                            )
-                        }
-                    }
-                }
-            }
-
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                runCatching {
-                    val msg = JSONObject(text)
-                    if (msg.optString("event") != "broadcast") return
-                    val payload = msg.optJSONObject("payload") ?: return
-                    if (payload.optString("event") != "notify") return
-                    val body = payload.optJSONObject("payload") ?: return
-                    val title = body.optString("title").ifEmpty { "小手机" }
-                    val text2 = body.optString("body").ifEmpty { "有新消息" }
-                    // 来电：全屏来电通知（任何一步失败回落普通通知，主路不受影响）
-                    if (body.optString("kind") == "call") {
-                        val shown = runCatching {
-                            showIncomingCallNotification(
-                                body.optString("characterName").ifEmpty { title },
-                                body.optString("sessionId"),
-                                body.optLong("callTs", System.currentTimeMillis()),
-                            )
-                        }.isSuccess
-                        if (shown) return
-                    }
-                    showMessageNotification(title, text2)
-                }
-            }
-
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                normal = true
-                synchronized(lock) { done = true; lock.notifyAll() }
-            }
-
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                synchronized(lock) { done = true; lock.notifyAll() }
-            }
-        }
-
-        socket = client.newWebSocket(
-            Request.Builder().url(wsUrl).build(),
-            listener,
-        )
-        synchronized(lock) {
-            while (!done && !stopped) runCatching { lock.wait(30_000) }
-        }
-        socket?.cancel()
-        socket = null
-        return normal
+        showMessageNotification(title, body)
     }
 
     // ── 通知 ──
