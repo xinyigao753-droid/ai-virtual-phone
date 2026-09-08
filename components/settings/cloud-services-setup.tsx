@@ -24,7 +24,13 @@ import {
     syncAllWeixinBotRuntimesToCloud,
 } from "@/lib/weixin-cloud-sync";
 import { connectPersonalPushCloud, deployPersonalPushCloud, isPersonalPushCloudActive } from "@/lib/personal-push-cloud";
-import { ensurePersonalPushSubscription, getOfflinePushState, markAccountPushSubscribed } from "@/lib/push-client";
+import {
+    ensurePersonalPushSubscription,
+    ensureShellPushSubscription,
+    getOfflinePushState,
+    isShellEnvironment,
+    markAccountPushSubscribed,
+} from "@/lib/push-client";
 import { getWeixinCloudDeployedAt, markWeixinCloudDeployed, savePushCloudScheduled, saveWeixinCloudScheduled } from "@/lib/cloud-deploy-status";
 import { Input, Select } from "@/components/ui/form";
 
@@ -319,10 +325,13 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
 
             if (scopePush) {
                 setProgress("部署离线推送…");
-                const pushWasEnabled = await getOfflinePushState() === "on";
+                const shellApp = isShellEnvironment();
+                const pushWasEnabled = shellApp ? false : await getOfflinePushState() === "on";
                 await deployPersonalPushCloud(token);
-                if (pushWasEnabled) {
-                    const subscription = await ensurePersonalPushSubscription();
+                if (shellApp || pushWasEnabled) {
+                    const subscription = shellApp
+                        ? await ensureShellPushSubscription()
+                        : await ensurePersonalPushSubscription();
                     if (!subscription.ok) {
                         throw new Error(`离线推送已部署，但本设备订阅迁移失败：${subscription.error || "未知错误"}。请到推送设置里重新开启离线推送。`);
                     }
@@ -377,9 +386,12 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
             try {
                 const push = await connectPersonalPushCloud();
                 if (push.status === "connected") {
-                    const pushWasEnabled = await getOfflinePushState() === "on";
-                    if (pushWasEnabled) {
-                        const subscription = await ensurePersonalPushSubscription();
+                    const shellApp = isShellEnvironment();
+                    const pushWasEnabled = shellApp ? false : await getOfflinePushState() === "on";
+                    if (shellApp || pushWasEnabled) {
+                        const subscription = shellApp
+                            ? await ensureShellPushSubscription()
+                            : await ensurePersonalPushSubscription();
                         if (!subscription.ok) {
                             lines.push(`离线推送：已连接 ✓（但本设备订阅注册失败：${subscription.error || "未知错误"}，请到推送设置里重新开启）`);
                         } else {

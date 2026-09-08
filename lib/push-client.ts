@@ -73,6 +73,12 @@ export function peekAccountPushSubscribed(): boolean | null {
 /** 当前账号（任意设备）是否有推送订阅。结果缓存 24 小时。 */
 export async function hasAccountPushSubscription(): Promise<boolean> {
     if (typeof window === "undefined") return false;
+    // 安卓壳不使用浏览器 PushSubscription。创建定时任务前直接把当前设备令牌
+    // 登记到个人云，避免被旧的 24 小时 false 缓存误判为“无订阅”。
+    if (isShellEnvironment()) {
+        if (!isPersonalPushCloudActive()) return false;
+        return (await ensureShellPushSubscription()).ok;
+    }
     try {
         const cached = kvGet(PUSH_GATE_KV);
         if (cached) {
@@ -236,6 +242,10 @@ export async function ensurePersonalPushSubscription(): Promise<{ ok: boolean; e
 }
 
 export async function getOfflinePushState(): Promise<OfflinePushState> {
+    if (isShellEnvironment()) {
+        if (!isPersonalPushCloudActive()) return "off";
+        return (await ensureShellPushSubscription()).ok ? "on" : "off";
+    }
     if (!isPushSupported()) return "unsupported";
     if (isPersonalPushCloudActive()) {
         const personalRegistration = await getPersonalPushRegistration(false);
@@ -255,7 +265,7 @@ export async function getOfflinePushState(): Promise<OfflinePushState> {
 
 export async function enableOfflinePush(): Promise<{ ok: boolean; error?: string }> {
     if (isShellEnvironment()) {
-        return { ok: false, error: "App 版自带推送通道，无需在此开启；保持系统通知权限开启即可收到离线消息。" };
+        return ensureShellPushSubscription();
     }
     if (!isPushSupported()) {
         return { ok: false, error: "当前环境不支持系统推送。iOS 请先「添加到主屏幕」，再从主屏幕图标打开开启。" };

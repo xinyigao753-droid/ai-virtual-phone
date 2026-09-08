@@ -7,8 +7,10 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.media.AudioAttributes
 import android.os.Build
 import android.os.IBinder
+import android.provider.Settings
 import androidx.core.app.NotificationCompat
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -30,7 +32,9 @@ class PushService : Service() {
 
     companion object {
         private const val CH_KEEPALIVE = "shell_keepalive"
-        private const val CH_MESSAGES = "shell_messages"
+        // 使用新渠道 ID，让从旧 APK 升级的设备也能获得 HIGH 级横幅默认值；
+        // Android 不允许应用提高一个已由系统创建过的旧渠道等级。
+        private const val CH_MESSAGES = "shell_messages_popup_v2"
         private const val CH_CALLS = "shell_calls"
         private const val NOTIF_FG_ID = 1
         private const val PUSH_PREFS = "shell_push"
@@ -146,7 +150,17 @@ class PushService : Service() {
         )
         manager.createNotificationChannel(
             NotificationChannel(CH_MESSAGES, "角色消息", NotificationManager.IMPORTANCE_HIGH).apply {
-                description = "角色发来的离线消息"
+                description = "角色发来的离线消息（横幅弹窗）"
+                setShowBadge(true)
+                enableVibration(true)
+                vibrationPattern = longArrayOf(0, 180, 120, 180)
+                setSound(
+                    Settings.System.DEFAULT_NOTIFICATION_URI,
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build(),
+                )
             },
         )
         manager.createNotificationChannel(
@@ -232,7 +246,9 @@ class PushService : Service() {
             .setContentText("未接来电")
             .setAutoCancel(true)
             .setContentIntent(contentIntent())
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setPriority(NotificationCompat.PRIORITY_MAX)
             .build()
         getSystemService(NotificationManager::class.java).notify(CallAlert.NOTIF_MISSED_ID, notification)
     }
@@ -245,7 +261,9 @@ class PushService : Service() {
             .setStyle(NotificationCompat.BigTextStyle().bigText(body))
             .setAutoCancel(true)
             .setContentIntent(contentIntent())
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setPriority(NotificationCompat.PRIORITY_MAX)
             .build()
         getSystemService(NotificationManager::class.java).notify(notifId++, notification)
         if (notifId > 400) notifId = 100

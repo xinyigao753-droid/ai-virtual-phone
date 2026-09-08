@@ -14,7 +14,45 @@ export function isIOSBrowser(): boolean {
     return /iPad|iPhone|iPod/i.test(ua) || (platform === "MacIntel" && navigator.maxTouchPoints > 1);
 }
 
+type AndroidShellDownloadBridge = {
+    beginFileDownload?: (filename: string, mimeType: string) => string;
+    appendFileDownloadChunk?: (id: string, base64: string) => boolean;
+    finishFileDownload?: (id: string) => boolean;
+    cancelFileDownload?: (id: string) => void;
+};
+
+function bytesToBase64(bytes: Uint8Array): string {
+    let binary = "";
+    const step = 0x8000;
+    for (let offset = 0; offset < bytes.length; offset += step) {
+        binary += String.fromCharCode(...bytes.subarray(offset, offset + step));
+    }
+    return btoa(binary);
+}
+
+async function downloadWithAndroidShell(blob: Blob, filename: string): Promise<boolean> {
+    const bridge = (window as typeof window & { AndroidShell?: AndroidShellDownloadBridge }).AndroidShell;
+    if (!bridge?.beginFileDownload || !bridge.appendFileDownloadChunk || !bridge.finishFileDownload) return false;
+    const id = bridge.beginFileDownload(filename, blob.type || "application/octet-stream");
+    if (!id) throw new Error("无法创建安卓下载文件。");
+    try {
+        const chunkBytes = 256 * 1024;
+        for (let offset = 0; offset < blob.size; offset += chunkBytes) {
+            const bytes = new Uint8Array(await blob.slice(offset, offset + chunkBytes).arrayBuffer());
+            if (!bridge.appendFileDownloadChunk(id, bytesToBase64(bytes))) {
+                throw new Error("写入安卓下载文件失败。");
+            }
+        }
+        if (!bridge.finishFileDownload(id)) throw new Error("完成安卓下载文件失败。");
+        return true;
+    } catch (error) {
+        bridge.cancelFileDownload?.(id);
+        throw error;
+    }
+}
+
 export async function downloadFile(blob: Blob, filename: string, options: DownloadFileOptions = {}): Promise<void> {
+    if (typeof window !== "undefined" && await downloadWithAndroidShell(blob, filename)) return;
     const url = URL.createObjectURL(blob);
     const anchorDownload = () => {
         const a = document.createElement("a");

@@ -12,6 +12,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
+import android.util.Base64
 import android.webkit.CookieManager
 import android.webkit.DownloadListener
 import android.webkit.JavascriptInterface
@@ -26,6 +27,10 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
+import java.io.File
+import java.io.FileOutputStream
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Float 小手机安卓壳：全屏 WebView 直接加载线上站点。
@@ -35,7 +40,7 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         val SITE_URL: String = BuildConfig.SITE_URL
-        const val VERSION = "1.0.0"
+        val VERSION: String = BuildConfig.VERSION_NAME
         /** 来电接听等场景的站内深链（必须以 SITE_URL 开头，否则忽略） */
         const val EXTRA_OPEN_URL = "open_url"
     }
@@ -43,13 +48,50 @@ class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
 
+    private data class NativeDownload(
+        val file: File,
+        val stream: FileOutputStream,
+        val name: String,
+    )
+
+    private data class ReadyDownload(val file: File, val name: String)
+
+    private val nativeDownloads = ConcurrentHashMap<String, NativeDownload>()
+    private var pendingSave: ReadyDownload? = null
+
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         val callback = filePathCallback ?: return@registerForActivityResult
         filePathCallback = null
-        val data = result.data?.data
-        callback.onReceiveValue(if (data != null) arrayOf(data) else emptyArray())
+        if (result.resultCode != RESULT_OK) {
+            callback.onReceiveValue(emptyArray())
+            return@registerForActivityResult
+        }
+        val uris = mutableListOf<Uri>()
+        result.data?.clipData?.let { clip ->
+            for (index in 0 until clip.itemCount) uris += clip.getItemAt(index).uri
+        }
+        result.data?.data?.let(uris::add)
+        callback.onReceiveValue(uris.distinctBy(Uri::toString).toTypedArray())
+    }
+
+    private val saveFileLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("*/*")
+    ) { uri ->
+        val ready = pendingSave ?: return@registerForActivityResult
+        pendingSave = null
+        if (uri == null) {
+            ready.file.delete()
+            return@registerForActivityResult
+        }
+        val saved = runCatching {
+            contentResolver.openOutputStream(uri, "w")?.use { output ->
+                ready.file.inputStream().use { input -> input.copyTo(output) }
+            } ?: error("无法打开保存位置")
+        }.isSuccess
+        ready.file.delete()
+        Toast.makeText(this, if (saved) "文件已保存" else "文件保存失败", Toast.LENGTH_SHORT).show()
     }
 
     private val notifPermissionLauncher = registerForActivityResult(
@@ -144,7 +186,23 @@ class MainActivity : AppCompatActivity() {
                 filePathCallback?.onReceiveValue(emptyArray())
                 filePathCallback = callback
                 return runCatching {
-                    fileChooserLauncher.launch(params.createIntent()); true
+                    val mimeTypes = params.acceptTypes
+                        .flatMap { it.split(',') }
+                        .map(String::trim)
+                        .filter { it.contains('/') && !it.startsWith('.') }
+                        .distinct()
+                    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+                        type = when {
+                            mimeTypes.size == 1 -> mimeTypes.first()
+                            mimeTypes.isNotEmpty() && mimeTypes.all { it.startsWith("image/") } -> "image/*"
+                            else -> "*/*"
+                        }
+                        if (mimeTypes.size > 1) putExtra(Intent.EXTRA_MIME_TYPES, mimeTypes.toTypedArray())
+                        putExtra(Intent.EXTRA_ALLOW_MULTIPLE, params.mode == FileChooserParams.MODE_OPEN_MULTIPLE)
+                    }
+                    fileChooserLauncher.launch(intent); true
                 }.getOrElse {
                     filePathCallback = null; false
                 }
@@ -212,6 +270,13 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         CookieManager.getInstance().flush()
+        nativeDownloads.values.forEach { download ->
+            runCatching { download.stream.close() }
+            download.file.delete()
+        }
+        nativeDownloads.clear()
+        pendingSave?.file?.delete()
+        pendingSave = null
         webView.destroy()
         super.onDestroy()
     }
@@ -224,6 +289,51 @@ class MainActivity : AppCompatActivity() {
         /** 个人云只保存这个随机设备令牌，不接触站点 Cookie 或用户 API 密钥。 */
         @JavascriptInterface
         fun getPushToken(): String = PushService.getOrCreatePushToken(applicationContext)
+
+        /** Blob 下载分块写入缓存，完成后交给系统“另存为”。避免 WebView 无法保存 blob: URL。 */
+        @JavascriptInterface
+        fun beginFileDownload(fileName: String, mimeType: String): String = runCatching {
+            val id = UUID.randomUUID().toString()
+            val safeName = fileName.substringAfterLast('/').substringAfterLast('\\')
+                .replace(Regex("[\\r\\n]"), "").take(160).ifBlank { "download.bin" }
+            val file = File.createTempFile("float-download-", ".part", cacheDir)
+            nativeDownloads[id] = NativeDownload(file, FileOutputStream(file), safeName)
+            id
+        }.getOrDefault("")
+
+        @JavascriptInterface
+        fun appendFileDownloadChunk(id: String, base64: String): Boolean = runCatching {
+            val download = nativeDownloads[id] ?: return false
+            download.stream.write(Base64.decode(base64, Base64.DEFAULT))
+            true
+        }.getOrDefault(false)
+
+        @JavascriptInterface
+        fun finishFileDownload(id: String): Boolean {
+            val download = nativeDownloads.remove(id) ?: return false
+            val closed = runCatching {
+                download.stream.flush()
+                download.stream.close()
+            }.isSuccess
+            if (!closed) {
+                download.file.delete()
+                return false
+            }
+            runOnUiThread {
+                pendingSave?.file?.delete()
+                pendingSave = ReadyDownload(download.file, download.name)
+                saveFileLauncher.launch(download.name)
+            }
+            return true
+        }
+
+        @JavascriptInterface
+        fun cancelFileDownload(id: String) {
+            nativeDownloads.remove(id)?.let { download ->
+                runCatching { download.stream.close() }
+                download.file.delete()
+            }
+        }
 
         /** 打开本应用的系统设置页（引导用户关电池限制、开自启动）。 */
         @JavascriptInterface
