@@ -85,6 +85,28 @@ export async function PATCH(request: Request) {
     if (!triggerKey) {
       return NextResponse.json({ ok: false, error: "缺少 triggerKey。" }, { status: 400 });
     }
+    // 本地定时器与云端 cron 的竞态协调：只有 pending 任务允许被本地接管。
+    if (body.claimLocal === true) {
+      const current = await supabaseRestFetch(
+        `push_jobs?user_id=eq.${encodeSupabaseFilter(account.id)}&trigger_key=eq.${encodeSupabaseFilter(triggerKey)}&select=id,status&limit=1`,
+      );
+      const rows = current.ok && Array.isArray(current.data) ? current.data as { id: string; status: string }[] : [];
+      const job = rows[0];
+      if (!job) return NextResponse.json({ ok: true, claimed: true, status: "missing" });
+      if (job.status !== "pending") return NextResponse.json({ ok: true, claimed: false, status: job.status });
+      const cancelled = await supabaseRestFetch(
+        `push_jobs?user_id=eq.${encodeSupabaseFilter(account.id)}&trigger_key=eq.${encodeSupabaseFilter(triggerKey)}&status=eq.pending`,
+        {
+          method: "PATCH",
+          headers: { Prefer: "return=representation" },
+          body: JSON.stringify({ status: "cancelled", result_note: "claimed by local app", updated_at: new Date().toISOString() }),
+        },
+      );
+      const cancelledRows = cancelled.ok && Array.isArray(cancelled.data)
+        ? cancelled.data as { id: string; status: string }[]
+        : [];
+      return NextResponse.json({ ok: true, claimed: cancelledRows.length > 0, status: cancelledRows[0]?.status || "pending" });
+    }
     const runNow = body.runNow === true;
     const filter = `user_id=eq.${encodeSupabaseFilter(account.id)}&trigger_key=eq.${encodeSupabaseFilter(triggerKey)}&status=eq.pending`;
     const result = await supabaseRestFetch(`push_jobs?${filter}`, {
