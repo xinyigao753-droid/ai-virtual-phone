@@ -109,7 +109,38 @@ export function isShellEnvironment(): boolean {
     return typeof navigator !== "undefined" && navigator.userAgent.includes("FloatShell/");
 }
 
-type AndroidShellBridge = { getPushToken?: () => string };
+type AndroidShellBridge = {
+    getPushToken?: () => string;
+    getPushStatus?: () => string;
+    openNotificationSettings?: () => void;
+};
+
+export type ShellPushStatus = {
+    notificationPermission: boolean;
+    notificationsEnabled: boolean;
+    lastStartAt: number;
+    lastPollAttemptAt: number;
+    lastPollOkAt: number;
+    lastMessageAt: number;
+    lastError: string;
+    tokenSuffix: string;
+};
+
+export function getShellPushStatus(): ShellPushStatus | null {
+    if (!isShellEnvironment()) return null;
+    try {
+        const raw = (window as typeof window & { AndroidShell?: AndroidShellBridge }).AndroidShell?.getPushStatus?.();
+        if (!raw) return null;
+        return JSON.parse(raw) as ShellPushStatus;
+    } catch {
+        return null;
+    }
+}
+
+export function openShellNotificationSettings(): void {
+    (window as typeof window & { AndroidShell?: AndroidShellBridge })
+        .AndroidShell?.openNotificationSettings?.();
+}
 
 /** 将安卓设备登记到个人云；通知内容随后由个人云经腾讯云中转给原生服务。 */
 export async function ensureShellPushSubscription(): Promise<{ ok: boolean; error?: string }> {

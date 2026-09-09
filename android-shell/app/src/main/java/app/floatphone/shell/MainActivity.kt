@@ -13,6 +13,8 @@ import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
 import android.util.Base64
+import android.view.View
+import android.view.WindowManager
 import android.webkit.CookieManager
 import android.webkit.DownloadListener
 import android.webkit.JavascriptInterface
@@ -98,8 +100,9 @@ class MainActivity : AppCompatActivity() {
 
     private val notifPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) PushService.start(this)
+    ) {
+        // 后台连接不依赖通知授权；授权只决定系统是否展示消息弹窗。
+        PushService.start(this)
     }
 
     // 网页侧 getUserMedia（通话按住说话、语音条录音、视频通话摄像头）触发的
@@ -246,7 +249,21 @@ class MainActivity : AppCompatActivity() {
 
     /** 壳本身必须铺满屏幕；虚拟手机内部的状态栏由网页自行绘制。 */
     private fun enableImmersiveFullscreen() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            window.attributes = window.attributes.apply {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
         WindowCompat.setDecorFitsSystemWindows(window, false)
+        @Suppress("DEPRECATION")
+        window.decorView.systemUiVisibility = (
+            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                or View.SYSTEM_UI_FLAG_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            )
         WindowInsetsControllerCompat(window, window.decorView).apply {
             hide(WindowInsetsCompat.Type.systemBars())
             systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
@@ -263,12 +280,7 @@ class MainActivity : AppCompatActivity() {
         enableImmersiveFullscreen()
         // 前台回来时无条件重新发送启动命令；已存在的服务只会收到 onStartCommand，
         // 被系统清理过的服务则会重新创建，避免后台推送静默失效。
-        if (Build.VERSION.SDK_INT < 33 ||
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-            == PackageManager.PERMISSION_GRANTED
-        ) {
-            PushService.start(this)
-        }
+        PushService.start(this)
     }
 
     /** singleTask：App 已在运行时（如全屏来电页接听）通过 onNewIntent 送达深链 */
@@ -287,13 +299,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun ensurePushService() {
+        // Android 13+ 即使尚未允许通知也可以启动前台服务；不能把云端领取绑定在通知权限上。
+        PushService.start(this)
         if (Build.VERSION.SDK_INT >= 33 &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
             != PackageManager.PERMISSION_GRANTED
         ) {
             notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-        } else {
-            PushService.start(this)
         }
     }
 
@@ -318,6 +330,22 @@ class MainActivity : AppCompatActivity() {
         /** 个人云只保存这个随机设备令牌，不接触站点 Cookie 或用户 API 密钥。 */
         @JavascriptInterface
         fun getPushToken(): String = PushService.getOrCreatePushToken(applicationContext)
+
+        /** 设置页读取真实的系统通知权限和后台连接状态。 */
+        @JavascriptInterface
+        fun getPushStatus(): String = PushService.getStatus(applicationContext).toString()
+
+        @JavascriptInterface
+        fun openNotificationSettings() {
+            runOnUiThread {
+                runCatching {
+                    startActivity(
+                        Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                            .putExtra(Settings.EXTRA_APP_PACKAGE, packageName),
+                    )
+                }
+            }
+        }
 
         /** Blob 下载分块写入缓存，完成后交给系统“另存为”。避免 WebView 无法保存 blob: URL。 */
         @JavascriptInterface

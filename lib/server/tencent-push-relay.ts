@@ -16,6 +16,7 @@ type Waiter = {
 type RelayStore = {
   queues: Map<string, QueuedMessage[]>;
   waiters: Map<string, Waiter[]>;
+  lastPollLogAt: Map<string, number>;
 };
 
 const TOKEN_PATTERN = /^[a-f0-9]{64}$/;
@@ -29,6 +30,7 @@ const globalRelay = globalThis as typeof globalThis & {
 const store = globalRelay.__floatTencentPushRelay ??= {
   queues: new Map(),
   waiters: new Map(),
+  lastPollLogAt: new Map(),
 };
 
 export function isValidTencentPushToken(value: unknown): value is string {
@@ -90,6 +92,11 @@ export function waitForTencentPush(
   timeoutMs = 25_000,
 ): Promise<RelayMessage | null> {
   const now = Date.now();
+  const lastPollLogAt = store.lastPollLogAt.get(token) ?? 0;
+  if (now - lastPollLogAt >= 5 * 60 * 1000) {
+    store.lastPollLogAt.set(token, now);
+    console.info("[push-relay] device polling", { tokenSuffix: token.slice(-8) });
+  }
   const queue = (store.queues.get(token) ?? [])
     .filter((item: QueuedMessage) => now - item.queuedAt < MESSAGE_TTL_MS);
   const queued = queue.shift();

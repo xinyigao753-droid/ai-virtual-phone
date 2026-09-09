@@ -25,7 +25,7 @@ import { loadCharacters } from "@/lib/character-storage";
 import { triggerImmediatePost } from "@/lib/moments-engine";
 import type { Character } from "@/lib/character-types";
 import { requestNotificationPermission } from "@/lib/browser-notification";
-import { disableOfflinePush, enableOfflinePush, getOfflinePushState, isShellEnvironment, loadPushQuietHours, savePushQuietHours, sendTestOfflinePush, type OfflinePushState } from "@/lib/push-client";
+import { disableOfflinePush, enableOfflinePush, getOfflinePushState, getShellPushStatus, isShellEnvironment, loadPushQuietHours, openShellNotificationSettings, savePushQuietHours, sendTestOfflinePush, type OfflinePushState, type ShellPushStatus } from "@/lib/push-client";
 import { isPersonalPushCloudActive, setPersonalPushCloudScheduled } from "@/lib/personal-push-cloud";
 import { loadPushCloudScheduled, savePushCloudScheduled } from "@/lib/cloud-deploy-status";
 import { armIdleReconnectBailout, armTimedWakeBailout, cancelBailoutKey, cancelBailoutPrefix } from "@/lib/push-bailout-client";
@@ -1175,6 +1175,7 @@ function OfflinePushSettingsPage({ onBack }: { onBack: () => void }) {
     const [isShellApp, setIsShellApp] = useState(false);
     const [offlinePushBusy, setOfflinePushBusy] = useState(false);
     const [offlinePushHint, setOfflinePushHint] = useState<string | null>(null);
+    const [shellPushStatus, setShellPushStatus] = useState<ShellPushStatus | null>(null);
     const [personalCloudActive, setPersonalCloudActive] = useState(false);
     const [pushCloudScheduled, setPushCloudScheduled] = useState(() => loadPushCloudScheduled());
     const [pushScheduleBusy, setPushScheduleBusy] = useState(false);
@@ -1216,11 +1217,32 @@ function OfflinePushSettingsPage({ onBack }: { onBack: () => void }) {
     };
 
     useEffect(() => {
-        setIsShellApp(isShellEnvironment());
+        const shell = isShellEnvironment();
+        setIsShellApp(shell);
         setPersonalCloudActive(isPersonalPushCloudActive());
         void getOfflinePushState().then(setOfflinePushState);
         refreshTimedSchedules();
+        if (shell) {
+            const refreshNativeStatus = () => setShellPushStatus(getShellPushStatus());
+            refreshNativeStatus();
+            const timer = window.setInterval(refreshNativeStatus, 5_000);
+            return () => window.clearInterval(timer);
+        }
     }, []);
+
+    const shellStatusHint = (() => {
+        if (!isShellApp) return "";
+        if (!shellPushStatus) return "正在读取 App 推送状态...";
+        if (!shellPushStatus.notificationPermission || !shellPushStatus.notificationsEnabled) {
+            return "系统通知权限未开启，后台连接可以运行，但手机不会显示通知；请点“通知设置”允许通知。";
+        }
+        if (!personalCloudActive) return "个人离线推送尚未部署，设备无法登记。";
+        if (offlinePushState !== "on") return "设备尚未登记到个人云，请重新部署个人离线推送后返回此页。";
+        if (!shellPushStatus.lastPollAttemptAt) return "设备已登记，后台连接正在启动...";
+        if (shellPushStatus.lastError) return `后台连接失败：${shellPushStatus.lastError}`;
+        if (!shellPushStatus.lastPollOkAt) return `后台正在连接腾讯云（设备 ${shellPushStatus.tokenSuffix}）...`;
+        return `系统通知和腾讯云连接正常（设备 ${shellPushStatus.tokenSuffix}）。`;
+    })();
 
     const handleOfflinePushToggle = async (enabled: boolean) => {
         if (offlinePushBusy) return;
@@ -1410,11 +1432,18 @@ function OfflinePushSettingsPage({ onBack }: { onBack: () => void }) {
                                     <span className="menu-desc">关掉后台后仍由系统推送通知（本设备）</span>
                                 </div>
                                 <div className="menu-right flex items-center gap-2">
-                                    {(offlinePushState === "on" || isShellApp) && (
+                                    {offlinePushState === "on" && (
                                         <button className="ui-btn ui-btn-outline py-1 px-2 ts-11" style={{ whiteSpace: "nowrap" }} onClick={() => void handleOfflinePushTest()} disabled={offlinePushBusy}>测试</button>
                                     )}
+                                    {isShellApp && (
+                                        <button
+                                            className="ui-btn ui-btn-outline py-1 px-2 ts-11"
+                                            style={{ whiteSpace: "nowrap" }}
+                                            onClick={openShellNotificationSettings}
+                                        >通知设置</button>
+                                    )}
                                     <Toggle
-                                        checked={offlinePushState === "on" || isShellApp}
+                                        checked={offlinePushState === "on"}
                                         disabled={offlinePushBusy || isShellApp || offlinePushState === "unsupported"}
                                         onChange={enabled => void handleOfflinePushToggle(enabled)}
                                     />
@@ -1456,7 +1485,7 @@ function OfflinePushSettingsPage({ onBack }: { onBack: () => void }) {
                         </div>
                         <p className="menu-group-desc mx-2">
                             {offlinePushHint || (isShellApp
-                                ? "App 版自带推送通道，已自动接管离线推送；保持系统通知权限开启即可，可点「测试」验证。"
+                                ? shellStatusHint
                                 : offlinePushState === "unsupported" ? "当前环境不支持。iOS 请先添加到主屏幕，从主屏幕打开后再开启。" : "")}
                         </p>
                     </>

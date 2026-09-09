@@ -13,6 +13,8 @@ import android.os.IBinder
 import android.provider.Settings
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -41,6 +43,11 @@ class PushService : Service() {
         private const val NOTIF_FG_ID = 1
         private const val PUSH_PREFS = "shell_push"
         private const val PUSH_TOKEN_KEY = "device_token"
+        private const val LAST_START_KEY = "last_start_ms"
+        private const val LAST_POLL_ATTEMPT_KEY = "last_poll_attempt_ms"
+        private const val LAST_POLL_OK_KEY = "last_poll_ok_ms"
+        private const val LAST_MESSAGE_KEY = "last_message_ms"
+        private const val LAST_ERROR_KEY = "last_error"
         fun start(context: Context) {
             // 不用进程内 running 门控：国产 ROM 可能直接杀掉服务而不回调 onDestroy，
             // 静态标记会永久残留，导致用户再次打开 App 时无法重新拉起推送服务。
@@ -59,6 +66,22 @@ class PushService : Service() {
             prefs.edit().putString(PUSH_TOKEN_KEY, created).apply()
             return created
         }
+
+        fun getStatus(context: Context): JSONObject {
+            val prefs = context.getSharedPreferences(PUSH_PREFS, Context.MODE_PRIVATE)
+            val permissionGranted = Build.VERSION.SDK_INT < 33 ||
+                ContextCompat.checkSelfPermission(context, android.Manifest.permission.POST_NOTIFICATIONS) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            return JSONObject()
+                .put("notificationPermission", permissionGranted)
+                .put("notificationsEnabled", NotificationManagerCompat.from(context).areNotificationsEnabled())
+                .put("lastStartAt", prefs.getLong(LAST_START_KEY, 0L))
+                .put("lastPollAttemptAt", prefs.getLong(LAST_POLL_ATTEMPT_KEY, 0L))
+                .put("lastPollOkAt", prefs.getLong(LAST_POLL_OK_KEY, 0L))
+                .put("lastMessageAt", prefs.getLong(LAST_MESSAGE_KEY, 0L))
+                .put("lastError", prefs.getString(LAST_ERROR_KEY, "").orEmpty())
+                .put("tokenSuffix", getOrCreatePushToken(context).takeLast(8))
+        }
     }
 
     private val client = OkHttpClient.Builder()
@@ -74,6 +97,8 @@ class PushService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        stopped = false
+        pushPrefs().edit().putLong(LAST_START_KEY, System.currentTimeMillis()).apply()
         createChannels()
         startForeground(NOTIF_FG_ID, buildKeepAliveNotification("等待连接…"))
         thread(name = "shell-push-loop") { connectionLoop() }
@@ -107,6 +132,7 @@ class PushService : Service() {
             } catch (error: Throwable) {
                 if (stopped) break
                 Log.w(TAG, "push relay connection failed; retry in ${backoffSec}s", error)
+                pushPrefs().edit().putString(LAST_ERROR_KEY, error.message.orEmpty().take(240)).apply()
                 updateKeepAlive("连接断开，重连中…")
                 sleepSec(backoffSec)
                 backoffSec = (backoffSec * 2).coerceAtMost(120)
@@ -115,6 +141,7 @@ class PushService : Service() {
     }
 
     private fun pollTencent(token: String): JSONObject? {
+        pushPrefs().edit().putLong(LAST_POLL_ATTEMPT_KEY, System.currentTimeMillis()).apply()
         val body = JSONObject().put("token", token).toString()
             .toRequestBody("application/json; charset=utf-8".toMediaType())
         val request = Request.Builder()
@@ -123,11 +150,15 @@ class PushService : Service() {
             .post(body)
             .build()
         client.newCall(request).execute().use { response ->
-            if (response.code == 204) return null
+            if (response.code == 204) {
+                markPollHealthy()
+                return null
+            }
             if (!response.isSuccessful) {
                 Log.w(TAG, "push relay HTTP ${response.code}")
                 error("push relay HTTP ${response.code}")
             }
+            markPollHealthy()
             val root = JSONObject(response.body?.string().orEmpty())
             return root.optJSONObject("message")
         }
@@ -137,6 +168,7 @@ class PushService : Service() {
         val title = message.optString("title").ifEmpty { "小手机" }
         val body = message.optString("body").ifEmpty { "有新消息" }
         Log.i(TAG, "received push type=${message.optString("type", "message")}")
+        pushPrefs().edit().putLong(LAST_MESSAGE_KEY, System.currentTimeMillis()).apply()
         if (message.optString("type") == "incoming_call") {
             val shown = runCatching {
                 showIncomingCallNotification(
@@ -282,5 +314,14 @@ class PushService : Service() {
 
     private fun sleepSec(sec: Long) {
         runCatching { Thread.sleep(sec * 1000) }
+    }
+
+    private fun pushPrefs() = getSharedPreferences(PUSH_PREFS, Context.MODE_PRIVATE)
+
+    private fun markPollHealthy() {
+        pushPrefs().edit()
+            .putLong(LAST_POLL_OK_KEY, System.currentTimeMillis())
+            .remove(LAST_ERROR_KEY)
+            .apply()
     }
 }
