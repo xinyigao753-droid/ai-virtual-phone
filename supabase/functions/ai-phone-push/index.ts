@@ -678,6 +678,29 @@ Deno.serve(async (request: Request) => {
       }
       if (request.method === "PATCH") {
         if (!triggerKey) return json({ ok: false, error: "缺少 triggerKey。" }, 400);
+        if (body.claimLocal === true) {
+          type JobState = { id: string; status: string };
+          const current = await readJson<JobState[]>(await rest(
+            `push_jobs?user_id=eq.${OWNER_ID}&trigger_key=eq.${encodeURIComponent(triggerKey)}&select=id,status&limit=1`,
+          ));
+          const job = current[0];
+          // 没有云端任务时由本地执行；这是预约失败/订阅刚失效时的正常降级。
+          if (!job) return json({ ok: true, claimed: true, status: "missing" });
+          if (job.status !== "pending") return json({ ok: true, claimed: false, status: job.status });
+          const cancelled = await readJson<JobState[]>(await rest(
+            `push_jobs?user_id=eq.${OWNER_ID}&trigger_key=eq.${encodeURIComponent(triggerKey)}&status=eq.pending`,
+            {
+              method: "PATCH",
+              headers: { Prefer: "return=representation" },
+              body: JSON.stringify({ status: "cancelled", result_note: "claimed by local app", updated_at: new Date().toISOString() }),
+            },
+          ));
+          if (cancelled.length > 0) return json({ ok: true, claimed: true, status: "cancelled" });
+          const after = await readJson<JobState[]>(await rest(
+            `push_jobs?user_id=eq.${OWNER_ID}&trigger_key=eq.${encodeURIComponent(triggerKey)}&select=id,status&limit=1`,
+          ));
+          return json({ ok: true, claimed: !after[0], status: after[0]?.status || "missing" });
+        }
         const executeAt = new Date(Date.now() + (body.runNow === true ? 0 : 90_000)).toISOString();
         await readJson(await rest(
           `push_jobs?user_id=eq.${OWNER_ID}&trigger_key=eq.${encodeURIComponent(triggerKey)}&status=eq.pending`,
