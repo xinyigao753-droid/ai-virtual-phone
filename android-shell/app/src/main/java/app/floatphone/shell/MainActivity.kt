@@ -27,6 +27,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import java.io.File
 import java.io.FileOutputStream
 import java.util.UUID
@@ -127,7 +129,7 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        WindowCompat.setDecorFitsSystemWindows(window, true)
+        enableImmersiveFullscreen()
         // 音量键默认调媒体流：WebView 里的语音条/TTS 都走媒体流播放，
         // 不设的话短音频没在播时按键调的是铃声，用户感觉"音量键无效、声音巨大"
         volumeControlStream = AudioManager.STREAM_MUSIC
@@ -240,6 +242,33 @@ class MainActivity : AppCompatActivity() {
         // 冷启动带深链（如来电接听）直接加载目标；否则加载首页
         webView.loadUrl(consumeOpenUrl(intent) ?: SITE_URL)
         ensurePushService()
+    }
+
+    /** 壳本身必须铺满屏幕；虚拟手机内部的状态栏由网页自行绘制。 */
+    private fun enableImmersiveFullscreen() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            hide(WindowInsetsCompat.Type.systemBars())
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) enableImmersiveFullscreen()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        enableImmersiveFullscreen()
+        // 前台回来时无条件重新发送启动命令；已存在的服务只会收到 onStartCommand，
+        // 被系统清理过的服务则会重新创建，避免后台推送静默失效。
+        if (Build.VERSION.SDK_INT < 33 ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            == PackageManager.PERMISSION_GRANTED
+        ) {
+            PushService.start(this)
+        }
     }
 
     /** singleTask：App 已在运行时（如全屏来电页接听）通过 onNewIntent 送达深链 */

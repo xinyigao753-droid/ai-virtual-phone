@@ -11,6 +11,7 @@ import android.media.AudioAttributes
 import android.os.Build
 import android.os.IBinder
 import android.provider.Settings
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -31,6 +32,7 @@ import kotlin.concurrent.thread
 class PushService : Service() {
 
     companion object {
+        private const val TAG = "FloatShellPush"
         private const val CH_KEEPALIVE = "shell_keepalive"
         // 使用新渠道 ID，让从旧 APK 升级的设备也能获得 HIGH 级横幅默认值；
         // Android 不允许应用提高一个已由系统创建过的旧渠道等级。
@@ -39,10 +41,9 @@ class PushService : Service() {
         private const val NOTIF_FG_ID = 1
         private const val PUSH_PREFS = "shell_push"
         private const val PUSH_TOKEN_KEY = "device_token"
-        private var running = false
-
         fun start(context: Context) {
-            if (running) return
+            // 不用进程内 running 门控：国产 ROM 可能直接杀掉服务而不回调 onDestroy，
+            // 静态标记会永久残留，导致用户再次打开 App 时无法重新拉起推送服务。
             val intent = Intent(context, PushService::class.java)
             if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent)
             else context.startService(intent)
@@ -73,7 +74,6 @@ class PushService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        running = true
         createChannels()
         startForeground(NOTIF_FG_ID, buildKeepAliveNotification("等待连接…"))
         thread(name = "shell-push-loop") { connectionLoop() }
@@ -83,9 +83,15 @@ class PushService : Service() {
 
     override fun onDestroy() {
         stopped = true
-        running = false
         client.dispatcher.cancelAll()
         super.onDestroy()
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // 用户划掉最近任务不应同时失去后台消息；START_STICKY 负责系统重启，
+        // 这里再主动触发一次可覆盖部分国产 ROM 的任务清理行为。
+        if (!stopped) runCatching { start(applicationContext) }
+        super.onTaskRemoved(rootIntent)
     }
 
     // 腾讯云每次保持约 25 秒长轮询；断网时退避，恢复后自动续上。
@@ -98,8 +104,9 @@ class PushService : Service() {
                 updateKeepAlive("已连接，等待角色消息")
                 backoffSec = 5
                 if (message != null) showRelayMessage(message)
-            } catch (_: Throwable) {
+            } catch (error: Throwable) {
                 if (stopped) break
+                Log.w(TAG, "push relay connection failed; retry in ${backoffSec}s", error)
                 updateKeepAlive("连接断开，重连中…")
                 sleepSec(backoffSec)
                 backoffSec = (backoffSec * 2).coerceAtMost(120)
@@ -117,7 +124,10 @@ class PushService : Service() {
             .build()
         client.newCall(request).execute().use { response ->
             if (response.code == 204) return null
-            if (!response.isSuccessful) error("push relay HTTP ${response.code}")
+            if (!response.isSuccessful) {
+                Log.w(TAG, "push relay HTTP ${response.code}")
+                error("push relay HTTP ${response.code}")
+            }
             val root = JSONObject(response.body?.string().orEmpty())
             return root.optJSONObject("message")
         }
@@ -126,6 +136,7 @@ class PushService : Service() {
     private fun showRelayMessage(message: JSONObject) {
         val title = message.optString("title").ifEmpty { "小手机" }
         val body = message.optString("body").ifEmpty { "有新消息" }
+        Log.i(TAG, "received push type=${message.optString("type", "message")}")
         if (message.optString("type") == "incoming_call") {
             val shown = runCatching {
                 showIncomingCallNotification(
