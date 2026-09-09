@@ -6,7 +6,21 @@ plugins {
 // 签名：CI 里通过环境变量注入 keystore（见 android-shell/README.md）；
 // 没有配置时 release 构建产出未签名 APK，debug 构建始终可直接安装测试。
 def ksFile = System.getenv("SHELL_KEYSTORE_FILE")
-def siteUrl = (System.getenv("SHELL_SITE_URL") ?: "https://example.invalid").replaceAll('/+$', '')
+def configuredSiteUrl = System.getenv("SHELL_SITE_URL")?.trim()
+if (!configuredSiteUrl) {
+    throw new GradleException("SHELL_SITE_URL 未设置：请在 GitHub Actions 的 site_url 或仓库变量中填写 HTTPS 站点地址")
+}
+def siteUrl = configuredSiteUrl.replaceAll('/+$', '')
+try {
+    def parsedSiteUrl = new java.net.URI(siteUrl)
+    if (parsedSiteUrl.scheme != 'https' || !parsedSiteUrl.host) {
+        throw new GradleException("SHELL_SITE_URL 必须是完整的 HTTPS 地址")
+    }
+} catch (GradleException error) {
+    throw error
+} catch (Exception error) {
+    throw new GradleException("SHELL_SITE_URL 不是有效的 HTTPS 地址", error)
+}
 
 android {
     namespace 'app.floatphone.shell'
