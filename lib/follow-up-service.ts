@@ -19,7 +19,7 @@ import {
 } from "./chat-storage";
 import type { ChatMessage, StateValue } from "./chat-storage";
 import { generateChatCompletion, flattenCompletionResult } from "./chat-engine";
-import { armFollowUpBailout, armIdleReconnectBailout, cancelBailoutKey, cancelBailoutPrefix, cancelFollowUpBailout, startBailoutHeartbeat } from "./push-bailout-client";
+import { armFollowUpBailout, armIdleReconnectBailout, cancelBailoutKey, cancelBailoutPrefix, cancelFollowUpBailout, claimBailoutForLocal, startBailoutHeartbeat } from "./push-bailout-client";
 import { isWithinPushQuietHours } from "./push-client";
 import {
     IDLE_RECONNECT_MAX_CONSECUTIVE,
@@ -629,11 +629,20 @@ async function fireIdleReconnect(rule: IdleReconnectRule, lastUserAt: number) {
 
 async function fireTimedWake(sched: TimedWakeSchedule) {
     timedWakeFiringSet.add(sched.id);
-    removeTimedWakeSchedule(sched.id);
-    // 本地接手触发：撤销服务端兜底预约（生成中被杀由发送保险单接管）
-    cancelBailoutKey(`timedwake:${sched.id}`);
 
     try {
+        // 先和云端抢占同一条预约，再移除本地计划。云端已 running/done 时直接跳过，
+        // 由 push_outbox 消费器把云端唯一结果合并回来，避免打开 App 后重复生成。
+        const triggerKey = `timedwake:${sched.id}`;
+        const localClaimed = await claimBailoutForLocal(triggerKey);
+        removeTimedWakeSchedule(sched.id);
+        if (!localClaimed) {
+            console.log(`[TimedWake] Cloud already claimed ${sched.id}, skip local generation`);
+            return;
+        }
+        // 本地接手后清理残留任务；生成中被杀则不会再有服务端兜底，故由发送保险单负责。
+        cancelBailoutKey(triggerKey);
+
         const sessions = loadChatSessions();
         const session = sessions.find(s => s.id === sched.sessionId);
         if (!session || session.contactId !== sched.characterId) return;

@@ -369,6 +369,33 @@ export function cancelBailoutKey(triggerKey: string): void {
     }).catch(() => undefined);
 }
 
+/**
+ * 在本地准备执行定时任务前，原子地取消服务端的 pending 任务。
+ * 返回 false 表示云端已经开始或完成执行，本地必须跳过，避免同一条定时消息生成两次。
+ * 没有任务时按本地接管处理：可能是订阅刚失效或预约请求曾经失败，本地仍应正常运行。
+ */
+export async function claimBailoutForLocal(triggerKey: string): Promise<boolean> {
+    if (!bailoutEnabled() || peekAccountPushSubscribed() === false) return true;
+    try {
+        const response = await pushJobsFetch({
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ triggerKey, claimLocal: true }),
+        });
+        if (!response.ok) return true;
+        const result = await response.json().catch(() => ({})) as {
+            claimed?: unknown;
+            status?: unknown;
+        };
+        // 新版个人云会明确返回 claimed；旧版网关只返回 ok，兼容旧部署继续本地执行。
+        if (typeof result.claimed !== "boolean") return true;
+        return result.claimed;
+    } catch {
+        // 云端不可达时不能阻塞本地定时功能。
+        return true;
+    }
+}
+
 /** 撤销一批兜底预约（前缀）。excludeKey 可保留一个刚挂上的新键（先挂后清模式）。
  *  返回 Promise 以便调用方在重挂前先等撤销落地。 */
 export async function cancelBailoutPrefix(triggerPrefix: string, excludeKey?: string): Promise<void> {
